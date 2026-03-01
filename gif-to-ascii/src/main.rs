@@ -70,11 +70,13 @@ fn convert_dump_to_ascii(dump_path: &Path, out_path: &Path) -> Result<()> {
 }
 
 /// Ask ImageMagick what the delay for each frame in the source GIF is and
-/// return the *average* delay (measured in hundredths of a second).  The
-/// original shell script used `identify -format "%T"` for this, and it saves
-/// us from depending on a particular version of the `gif` crate just to peek
-/// at a few numbers.
-fn determine_avg_delay(path: &Path) -> Result<u32> {
+/// return all of the values (measured in hundredths of a second).  The
+/// caller can average them or use them individually when recreating the
+/// output GIF.  The original shell script just grabbed an average with
+/// `identify -format "%T"` and we used that for simplicity; here we keep
+/// the per-frame delays so that the converted GIF can match the exact
+/// timing of the input (e.g. 23 fps would become delay≈4).
+fn get_frame_delays(path: &Path) -> Result<Vec<u32>> {
     let output = Command::new("magick")
         .args(&["identify", "-format", "%T\n", path.to_str().unwrap()])
         .output()
@@ -85,18 +87,16 @@ fn determine_avg_delay(path: &Path) -> Result<u32> {
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut total = 0u32;
-    let mut count = 0u32;
+    let mut delays = Vec::new();
     for line in text.lines() {
         if let Ok(val) = line.trim().parse::<u32>() {
-            total += val;
-            count += 1;
+            delays.push(val);
         }
     }
-    if count == 0 {
+    if delays.is_empty() {
         anyhow::bail!("no frames reported by ImageMagick");
     }
-    Ok(total / count)
+    Ok(delays)
 }
 
 #[derive(Parser, Debug)]
@@ -128,7 +128,8 @@ fn main() -> Result<()> {
     let frame_dir = working.join("frame_images");
     fs::create_dir_all(&frame_dir).context("creating frame output directory")?;
 
-    // extract frames with ffmpeg at original frame rate (we will later copy delays)
+    // extract frames with ffmpeg; we don't need to specify a framerate
+    // because ffmpeg will split into exactly one image per input frame.
     let status = Command::new("ffmpeg")
         .args(&["-i", cli.input.to_str().unwrap(), &format!("{}/frame%04d.png", frame_dir.display())])
         .status()
@@ -137,7 +138,15 @@ fn main() -> Result<()> {
         anyhow::bail!("ffmpeg failed");
     }
 
-    let avg_delay = determine_avg_delay(&cli.input)?;
+    // grab per-frame delays so we can reassemble with the same timing
+    let delays = get_frame_delays(&cli.input)?;
+    let avg_delay = delays.iter().sum::<u32>() / (delays.len() as u32);
+    let fps = if avg_delay > 0 {
+        100.0 / (avg_delay as f64)
+    } else {
+        0.0
+    };
+    eprintln!("original average delay {} (≈{:.2} fps)", avg_delay, fps);
 
     // process each extracted PNG
     let mut pngs: Vec<PathBuf> = fs::read_dir(&frame_dir)?
@@ -199,21 +208,30 @@ fn main() -> Result<()> {
         }
     }
 
-    // finally, assemble gif from ascii_pngs
+    // finally, assemble gif from ascii_pngs.  We pair each image with its
+    // corresponding delay so the output matches the original timing.
     let output = cli
         .output
         .unwrap_or_else(|| cli.input.with_file_name("ascii.gif"));
-    // convert delay from hundredths to ImageMagick units (1/100th sec per unit)
-    let delay = avg_delay as u32;
 
-    // build a command: magick -delay <delay> ascii_png/*.png output.gif
+    // collect ascii images in sorted order so they line up with `delays`
+    let mut ascii_images: Vec<PathBuf> = fs::read_dir(&ascii_png_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("png"))
+        .collect();
+    ascii_images.sort();
+
+    if ascii_images.len() != delays.len() {
+        eprintln!("warning: frame count and delay count differ ({} vs {})",
+                  ascii_images.len(), delays.len());
+    }
+
     let mut cmd = Command::new("magick");
-    cmd.arg("-delay").arg(delay.to_string());
-    for entry in fs::read_dir(&ascii_png_dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("png") {
-            cmd.arg(path.to_str().unwrap());
-        }
+    for (i, img) in ascii_images.iter().enumerate() {
+        let d = delays.get(i).cloned().unwrap_or(avg_delay);
+        cmd.arg("-delay").arg(d.to_string());
+        cmd.arg(img.to_str().unwrap());
     }
     cmd.arg(output.to_str().unwrap());
     let status = cmd.status().context("assembling output gif")?;

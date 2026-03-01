@@ -7,3 +7,7 @@ edition = "2024"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 chrono = "0.4"
+
+[[bin]]
+name = "gif-to-ascii"
+path = "src/main.rs"
