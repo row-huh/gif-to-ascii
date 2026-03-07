@@ -1,13 +1,30 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use image::{ImageBuffer, Rgb, RgbImage};
+use imageproc::drawing::draw_text_mut;
+use ab_glyph::{FontVec, PxScale};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const FONT_RATIO: f64 = 0.5;
 const LUMINANCE_THRESHOLD: f64 = 16.0;
 const ASCII_CHARS: &[char] = &[' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
+
+// Font metrics for rendering — tweak CHAR_W/CHAR_H if your font differs
+const FONT_SIZE: f32 = 12.0;
+const CHAR_W: u32 = 7;  // pixels per character cell (width)
+const CHAR_H: u32 = 14; // pixels per character cell (height)
+
+/// A single coloured ASCII character at a grid position.
+#[derive(Clone)]
+struct ColoredChar {
+    ch: char,
+    r: u8,
+    g: u8,
+    b: u8,
+}
 
 fn pixel_for(r: u8, g: u8, b: u8) -> char {
     let lum = 0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64;
@@ -20,11 +37,6 @@ fn pixel_for(r: u8, g: u8, b: u8) -> char {
     }
 }
 
-/// Parse a single ImageMagick colour channel value to u8.
-/// Handles all three formats ImageMagick may emit:
-///   - integer:   "255"
-///   - float:     "255.0" or "254.7"
-///   - percent:   "100%" or "50.2%"
 fn parse_channel(s: &str) -> Result<u8> {
     let s = s.trim();
     if let Some(pct) = s.strip_suffix('%') {
@@ -36,14 +48,15 @@ fn parse_channel(s: &str) -> Result<u8> {
     }
 }
 
-/// Read a text-based ImageMagick dump and convert it into ASCII art lines.
-/// Handles srgb(r,g,b) and srgba(r,g,b,a) with integer, float or percent values.
-fn convert_dump_to_ascii(dump_path: &Path, out_path: &Path) -> Result<()> {
+/// Parse an ImageMagick pixel dump into a 2D grid of coloured ASCII chars.
+/// Returns (rows, cols, pixels) where pixels is row-major.
+fn parse_dump_to_colored(dump_path: &Path) -> Result<(usize, usize, Vec<Vec<ColoredChar>>)> {
     let input = fs::File::open(dump_path).context("opening dump file")?;
     let reader = BufReader::new(input);
-    let mut writer = fs::File::create(out_path).context("creating ascii output file")?;
 
-    let mut prev_y: Option<u32> = None;
+    // rows[y] = vec of ColoredChar in x order
+    let mut rows: Vec<Vec<ColoredChar>> = Vec::new();
+    let mut prev_y: Option<usize> = None;
 
     for line in reader.lines().skip(1) {
         let line = line?;
@@ -52,15 +65,13 @@ fn convert_dump_to_ascii(dump_path: &Path, out_path: &Path) -> Result<()> {
             continue;
         }
 
-        // Format: "x,y: (r,g,b)\tsrgb(r,g,b)"  or  "x,y: srgb(r,g,b)"
         let Some((coord_part, rest)) = line.split_once(':') else { continue };
         let Some((_, y_str)) = coord_part.split_once(',') else { continue };
-        let y: u32 = match y_str.trim().parse() {
+        let y: usize = match y_str.trim().parse() {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        // Find the srgb/srgba(...) token anywhere on the rest of the line.
         let color_token = rest
             .split_whitespace()
             .find(|t| t.starts_with("srgb(") || t.starts_with("srgba("))
@@ -70,7 +81,6 @@ fn convert_dump_to_ascii(dump_path: &Path, out_path: &Path) -> Result<()> {
             });
 
         let Some(token) = color_token else { continue };
-
         let inner = token
             .trim_start_matches("srgba(")
             .trim_start_matches("srgb(")
@@ -90,15 +100,51 @@ fn convert_dump_to_ascii(dump_path: &Path, out_path: &Path) -> Result<()> {
         let ch = pixel_for(r, g, b);
 
         if Some(y) != prev_y {
-            if prev_y.is_some() {
-                writer.write_all(b"\n")?;
-            }
+            rows.push(Vec::new());
             prev_y = Some(y);
         }
-        writer.write_all(ch.to_string().as_bytes())?;
+
+        rows.last_mut().unwrap().push(ColoredChar { ch, r, g, b });
     }
 
-    writer.write_all(b"\n")?;
+    let n_rows = rows.len();
+    let n_cols = rows.first().map(|r| r.len()).unwrap_or(0);
+    Ok((n_rows, n_cols, rows))
+}
+
+/// Render a grid of coloured ASCII chars to a PNG image.
+fn render_colored_ascii(
+    rows: &[Vec<ColoredChar>],
+    n_cols: usize,
+    font: &FontVec,
+    out_path: &Path,
+) -> Result<()> {
+    let img_w = n_cols as u32 * CHAR_W;
+    let img_h = rows.len() as u32 * CHAR_H;
+    let mut img: RgbImage = ImageBuffer::from_pixel(img_w, img_h, Rgb([0u8, 0u8, 0u8]));
+
+    let scale = PxScale::from(FONT_SIZE);
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        let y = row_idx as i32 * CHAR_H as i32;
+        for (col_idx, cc) in row.iter().enumerate() {
+            if cc.ch == ' ' {
+                continue;
+            }
+            let x = col_idx as i32 * CHAR_W as i32;
+            draw_text_mut(
+                &mut img,
+                Rgb([cc.r, cc.g, cc.b]),
+                x,
+                y,
+                scale,
+                font,
+                &cc.ch.to_string(),
+            );
+        }
+    }
+
+    img.save(out_path).context("saving colored ascii PNG")?;
     Ok(())
 }
 
@@ -106,17 +152,12 @@ fn get_frame_delays(path: &Path) -> Result<Vec<u32>> {
     let output = Command::new("magick")
         .args(["identify", "-format", "%T\n", path.to_str().unwrap()])
         .output()
-        .context("running magick identify to extract frame delays")?;
-
+        .context("running magick identify")?;
     if !output.status.success() {
         anyhow::bail!("magick identify returned an error");
     }
-
     let text = String::from_utf8_lossy(&output.stdout);
-    let delays: Vec<u32> = text.lines()
-        .filter_map(|l| l.trim().parse().ok())
-        .collect();
-
+    let delays: Vec<u32> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
     if delays.is_empty() {
         anyhow::bail!("no frames reported by ImageMagick");
     }
@@ -136,20 +177,24 @@ fn image_dimensions(path: &Path) -> Result<(u32, u32)> {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Convert a GIF into an ASCII-art GIF.")]
+#[command(author, version, about = "Convert a GIF into a coloured ASCII-art GIF.")]
 struct Cli {
     /// Input GIF file to convert
     input: PathBuf,
 
-    /// Output GIF file name (will be overwritten if it exists)
+    /// Output GIF file name
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Target number of columns in the ASCII output (controls width)
+    /// Target number of columns in the ASCII output
     #[arg(short, long, default_value_t = 80)]
     columns: u32,
 
-    /// Keep intermediate working files instead of deleting them
+    /// Path to a monospace TTF font file
+    #[arg(short, long, default_value = "/usr/share/fonts/liberation/LiberationMono-Regular.ttf")]
+    font: PathBuf,
+
+    /// Keep intermediate working files
     #[arg(long)]
     keep: bool,
 }
@@ -161,6 +206,12 @@ fn main() -> Result<()> {
         anyhow::bail!("input file does not exist: {}", cli.input.display());
     }
 
+    // Load font once upfront
+    let font_data = fs::read(&cli.font)
+        .with_context(|| format!("reading font file: {}", cli.font.display()))?;
+    let font = FontVec::try_from_vec(font_data)
+        .context("parsing font — make sure it's a valid TTF")?;
+
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -169,7 +220,7 @@ fn main() -> Result<()> {
     let frame_dir = working.join("frame_images");
     let ascii_png_dir = working.join("ascii_png");
     for d in &[&frame_dir, &ascii_png_dir] {
-        fs::create_dir_all(d).context("creating working directory")?;
+        fs::create_dir_all(d)?;
     }
 
     // 1. Extract frames
@@ -181,15 +232,12 @@ fn main() -> Result<()> {
         ])
         .status()
         .context("running ffmpeg")?;
-    if !status.success() {
-        anyhow::bail!("ffmpeg failed");
-    }
+    if !status.success() { anyhow::bail!("ffmpeg failed"); }
 
     // 2. Per-frame delays
     let delays = get_frame_delays(&cli.input)?;
     let avg_delay = delays.iter().sum::<u32>() / (delays.len() as u32);
-    let fps = if avg_delay > 0 { 100.0 / avg_delay as f64 } else { 0.0 };
-    eprintln!("Original average delay {}cs (≈{:.2} fps)", avg_delay, fps);
+    eprintln!("Average delay {}cs (≈{:.2} fps)", avg_delay, 100.0 / avg_delay as f64);
 
     // 3. Collect PNGs
     let mut pngs: Vec<PathBuf> = fs::read_dir(&frame_dir)?
@@ -200,7 +248,7 @@ fn main() -> Result<()> {
     pngs.sort();
     eprintln!("Processing {} frames...", pngs.len());
 
-    // 4. Resize -> dump -> ASCII txt
+    // 4. Per frame: resize → dump → colored PNG (all in one pass, no txt file needed)
     for (i, png) in pngs.iter().enumerate() {
         let (orig_w, orig_h) = image_dimensions(png)?;
         let new_w = cli.columns;
@@ -210,6 +258,7 @@ fn main() -> Result<()> {
 
         let stem = png.file_stem().unwrap().to_string_lossy().into_owned();
 
+        // Resize
         let resized = frame_dir.join(format!("{stem}-resized.png"));
         let status = Command::new("magick")
             .args([
@@ -217,71 +266,37 @@ fn main() -> Result<()> {
                 "-resize", &format!("{new_w}x{new_h}!"),
                 resized.to_str().unwrap(),
             ])
-            .status()
-            .context("resizing frame")?;
+            .status()?;
         if !status.success() { anyhow::bail!("magick resize failed on frame {i}"); }
 
+        // Dump pixels to text
         let dump = frame_dir.join(format!("{stem}.txt"));
         let status = Command::new("magick")
             .args([resized.to_str().unwrap(), dump.to_str().unwrap()])
-            .status()
-            .context("creating text dump")?;
+            .status()?;
         if !status.success() { anyhow::bail!("magick dump failed on frame {i}"); }
 
-        // DEBUG: print the first few lines of the dump so you can verify the format
-        if i == 0 {
-            let f = fs::File::open(&dump)?;
-            let r = BufReader::new(f);
-            eprintln!("=== Dump format sample (frame 0) ===");
-            for l in r.lines().take(5) {
-                eprintln!("  {:?}", l?);
-            }
-            eprintln!("=====================================");
+        // Parse dump → colored chars → render directly to PNG
+        let (n_rows, n_cols, rows) = parse_dump_to_colored(&dump)
+            .with_context(|| format!("parsing dump for frame {i}"))?;
+
+        if n_rows == 0 || n_cols == 0 {
+            anyhow::bail!("frame {i} produced an empty pixel grid");
         }
 
-        let ascii_txt = frame_dir.join(format!("{stem}.ascii.txt"));
-        convert_dump_to_ascii(&dump, &ascii_txt)
-            .with_context(|| format!("converting dump to ASCII for frame {i}"))?;
+        let png_out = ascii_png_dir.join(format!("{stem}.png"));
+        render_colored_ascii(&rows, n_cols, &font, &png_out)
+            .with_context(|| format!("rendering frame {i}"))?;
 
         fs::remove_file(&resized)?;
         fs::remove_file(&dump)?;
 
         if (i + 1) % 5 == 0 || i + 1 == pngs.len() {
-            eprintln!("  {}/{} frames converted", i + 1, pngs.len());
+            eprintln!("  {}/{} frames rendered", i + 1, pngs.len());
         }
     }
 
-    // 5. Render ASCII txt -> PNG
-    eprintln!("Rendering ASCII frames to PNG...");
-    let mut ascii_txts: Vec<PathBuf> = fs::read_dir(&frame_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.to_str().map(|s| s.ends_with(".ascii.txt")).unwrap_or(false))
-        .collect();
-    ascii_txts.sort();
-
-    for (i, txt) in ascii_txts.iter().enumerate() {
-        let base = txt
-            .file_name().unwrap()
-            .to_string_lossy()
-            .replace(".ascii.txt", "");
-        let png_out = ascii_png_dir.join(format!("{base}.png"));
-
-        let status = Command::new("magick")
-            .args([
-                "-background", "white",
-                "-fill",       "black",
-                "-font",       "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-                "-pointsize",  "12",
-                &format!("label:@{}", txt.display()),
-                png_out.to_str().unwrap(),
-            ])
-            .status()
-            .context("rendering ASCII text to PNG")?;
-        if !status.success() { anyhow::bail!("magick label render failed on frame {i}"); }
-    }
-
-    // 6. Assemble GIF
+    // 5. Assemble GIF
     eprintln!("Assembling output GIF...");
     let mut ascii_images: Vec<PathBuf> = fs::read_dir(&ascii_png_dir)?
         .filter_map(|e| e.ok())
@@ -291,10 +306,7 @@ fn main() -> Result<()> {
     ascii_images.sort();
 
     if ascii_images.len() != delays.len() {
-        eprintln!(
-            "Warning: {} frames but {} delays; extras use average delay",
-            ascii_images.len(), delays.len()
-        );
+        eprintln!("Warning: {} frames, {} delays", ascii_images.len(), delays.len());
     }
 
     let output = cli.output
@@ -309,16 +321,15 @@ fn main() -> Result<()> {
     }
     cmd.arg(output.to_str().unwrap());
 
-    let status = cmd.status().context("assembling output GIF")?;
+    let status = cmd.status().context("assembling GIF")?;
     if !status.success() { anyhow::bail!("magick GIF assembly failed"); }
 
-    println!("ASCII GIF written to {}", output.display());
+    println!("✓ ASCII GIF written to {}", output.display());
 
-    // 7. Cleanup
     if cli.keep {
-        println!("Intermediate files kept in {}", working.display());
+        println!("Intermediate files in {}", working.display());
     } else {
-        fs::remove_dir_all(&working).context("removing working directory")?;
+        fs::remove_dir_all(&working)?;
     }
 
     Ok(())
