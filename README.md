@@ -2,15 +2,16 @@
 
 | Original | ASCII |
 |----------|-------|
-| ![orignal](readme-assets/itachi.gif__) | ![ascii](readme-assets/itachi-ascii.gif__) |
+| <img src="readme-assets/itachi.gif" width="450px" height="300px"/> | <img src="readme-assets/itachi-ascii.gif" width="470px" height="300px"/> |
 
-</div>
+</div>  
 
 # gif-to-ascii
 
 Two separate tools for converting GIFs to ASCII art:
 
-- **Web converter** — runs locally in the browser, TypeScript, with full parameter control
+- **Web converter** — converter built in typescript that runs locally on the browser, has higher customization with parameters (Lumonisity, Contrast, Intensity, Detail)
+
 - **CLI** — Rust-based, work in progress ([jump to section](#cli-a-work-in-progress))
 
 ---
@@ -18,12 +19,15 @@ Two separate tools for converting GIFs to ASCII art:
 ## Web Converter
 
 > **Live:** [add-url]  
-> **Demo:** ![readme-assets/demo.mp4](readme-assets/demo.mp4)
+> **Demo:**
+
+  
+<video src="readme-assets/demo.mp4" controls width="100%">
+</video>
 
 ### Parameters
 
-Tweak these to dial in the look you want:
-
+Tinker around and find out the best settings for your gifs
 | Parameter | Effect |
 |-----------|--------|
 | **Luminosity** | — |
@@ -37,7 +41,6 @@ Tweak these to dial in the look you want:
 
 Both tools are developed independently.
 
-### Goals
+### Goals for cli
 
 - `gif-to-ascii /path/to/gif` — outputs an ASCII gif in the working directory
-- eventually: a command to set a gif in [fastfetch](https://github.com/fastfetch-cli/fastfetch) *(this was the original motivation — the converter came first)*
