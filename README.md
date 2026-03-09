@@ -1,9 +1,3 @@
-<p align="center">
-  <img src="readme-assets/hero.gif" />
-  <br/>
-  <span style="opacity:0.2; font-size:0.2em;"><em><i>gif was converted using the tool</i></em></span>
-</p>
-
 
 # Gif 2 Ascii
 Two separate tools for converting GIFs to ASCII art:
