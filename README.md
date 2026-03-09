@@ -1,9 +1,4 @@
-<div align="center">
-
-| Original | ASCII |
-|----------|-------|
-| <img src="readme-assets/itachi.gif" width="450px" height="300px"/> | <img src="readme-assets/itachi-ascii.gif" width="470px" height="300px"/> |
-
+![ascii](readme-assets/hero.gif)
 </div>  
 
 # gif-to-ascii
